@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 VERSION = "2.1.0"
 SERVICE_NAME = "sm-devsecops"
 DISPLAY_NAME = "SM DevSecOps"
-DESCRIPTION = "安全研发平台：代码扫描、依赖审计、镜像扫描、SBOM 与流水线"
+DESCRIPTION = "安全开发生命周期与云原生安全：扫描、漏洞管理、策略与合规门禁"
 ENVIRONMENT = os.getenv("SM_ENV", "development").lower()
 ALLOWED_HOSTS = [h.strip() for h in os.getenv("SM_ALLOWED_HOSTS", "localhost,127.0.0.1,testserver").split(",") if h.strip()]
 REQUESTS = {"total": 0, "errors": 0, "latency_ms_total": 0.0}
@@ -38,7 +38,7 @@ AUDIT_CENTER_URL = os.getenv("SM_AUDIT_CENTER_URL", "")
 INTEGRATION_DEPENDENCIES = ['sm-iam', 'sm-audit-log-center']
 INTEGRATION_EVENTS = ["health.checked", "resource.changed", "audit.recorded"]
 _db_conn: sqlite3.Connection | None = None
-_db_lock = threading.Lock()
+_db_lock = threading.RLock()
 
 
 def db() -> sqlite3.Connection:
@@ -185,12 +185,12 @@ app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 
 class Item(BaseModel):
     name: str = Field(min_length=1, max_length=120)
-    owner: str = Field(default="研发效能部", min_length=1, max_length=80)
+    owner: str = Field(default="平台工程部", min_length=1, max_length=80)
     priority: Literal["P0", "P1", "P2", "P3"] = "P1"
     status: Literal["planned", "active", "review", "closed"] = "active"
 
 ITEMS: list[dict[str, object]] = [
-    {"id": "demo-1", "name": "核心能力基线", "owner": "研发效能部", "priority": "P1", "status": "active", "created_at": datetime.now(UTC).isoformat()},
+    {"id": "demo-1", "name": "核心能力基线", "owner": "平台工程部", "priority": "P1", "status": "active", "created_at": datetime.now(UTC).isoformat()},
     {"id": "demo-2", "name": "安全与审计策略", "owner": "安全合规部", "priority": "P1", "status": "review", "created_at": datetime.now(UTC).isoformat()},
 ]
 
