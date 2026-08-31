@@ -1,352 +1,199 @@
+"""SM DevSecOps —— 安全研发平台：扫描任务、漏洞闭环、安全策略与 SBOM。"""
+
 from __future__ import annotations
 
-import base64
-import hashlib
-import hmac
 import json
-import os
-import secrets
-import sqlite3
-import threading
-import time
 import uuid
 from datetime import UTC, datetime
-from pathlib import Path
-from typing import Literal
+from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request, Response, status
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import FileResponse
+from fastapi import HTTPException, Request, status
 from pydantic import BaseModel, Field
 
-VERSION = "2.1.0"
-SERVICE_NAME = "sm-devsecops"
-DISPLAY_NAME = "SM DevSecOps"
-DESCRIPTION = "安全开发生命周期与云原生安全：扫描、漏洞管理、策略与合规门禁"
-ENVIRONMENT = os.getenv("SM_ENV", "development").lower()
-ALLOWED_HOSTS = [h.strip() for h in os.getenv("SM_ALLOWED_HOSTS", "localhost,127.0.0.1,testserver").split(",") if h.strip()]
-REQUESTS = {"total": 0, "errors": 0, "latency_ms_total": 0.0}
-RATE_BUCKETS: dict[str, tuple[int, int]] = {}
-rate_limit_lock = threading.Lock()
-MAX_REQUEST_BYTES = int(os.getenv("SM_MAX_REQUEST_BYTES", "1048576"))
-RATE_WINDOW_SECONDS = int(os.getenv("SM_RATE_WINDOW_SECONDS", "60"))
-RATE_MAX_REQUESTS = int(os.getenv("SM_RATE_MAX_REQUESTS", "600"))
-INTERNAL_API_KEY = os.getenv("SM_INTERNAL_API_KEY", "")
-JWT_SECRET = os.getenv("SM_JWT_SECRET", "")
-DATABASE_PATH = os.getenv("SM_DATABASE_PATH", "")
-AUDIT_CENTER_URL = os.getenv("SM_AUDIT_CENTER_URL", "")
-INTEGRATION_DEPENDENCIES = ['sm-iam', 'sm-audit-log-center']
-INTEGRATION_EVENTS = ["health.checked", "resource.changed", "audit.recorded"]
-_db_conn: sqlite3.Connection | None = None
-_db_lock = threading.RLock()
+from app import base
+
+SERVICE = "sm-devsecops"
+VERSION = "2.0.0"
+NAME = "SM DevSecOps"
+DESCRIPTION = "安全研发平台：扫描任务、漏洞闭环、安全策略与 SBOM"
+PORT = 8340
 
 
-def db() -> sqlite3.Connection:
-    global _db_conn
-    if _db_conn is not None:
-        return _db_conn
-    with _db_lock:
-        if _db_conn is not None:
-            return _db_conn
-        target = DATABASE_PATH or ":memory:"
-        if target != ":memory:":
-            Path(target).parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(target, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _init() -> None:
+    with base.db_ctx() as conn:
         conn.executescript(
             """
-            CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS audit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT, service TEXT, action TEXT, actor TEXT, timestamp TEXT, request_id TEXT, trace_id TEXT, detail TEXT, integrity TEXT);
+            CREATE TABLE IF NOT EXISTS scans (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, target TEXT NOT NULL,
+                scan_type TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'running',
+                severity_counts TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, finished_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS findings (
+                id TEXT PRIMARY KEY, scan_id TEXT NOT NULL, severity TEXT NOT NULL,
+                rule TEXT NOT NULL, file TEXT, description TEXT, status TEXT NOT NULL DEFAULT 'open',
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS policies (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, rule TEXT NOT NULL,
+                action TEXT NOT NULL DEFAULT 'warn', enabled INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS sboms (
+                id TEXT PRIMARY KEY, scan_id TEXT NOT NULL, format TEXT NOT NULL DEFAULT 'cyclonedx',
+                content TEXT NOT NULL, created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_findings_severity ON findings(severity, status);
             """
         )
-        conn.commit()
-        _db_conn = conn
-        return conn
 
 
-def setting(key: str, default: str = "") -> str:
-    row = db().execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-    return str(row["value"]) if row else default
+app = base.create_app(
+    service=SERVICE, name=NAME, description=DESCRIPTION, version=VERSION, port=PORT,
+    dependencies=["sm-iam", "sm-event-bus", "sm-audit-log-center"],
+    events=["scan.completed", "finding.triaged", "policy.blocked"],
+    overview_fn=lambda _r: {
+        "summary": {
+            "scans": base.get_db().execute("SELECT COUNT(*) FROM scans").fetchone()[0],
+            "open_findings": base.get_db().execute("SELECT COUNT(*) FROM findings WHERE status='open'").fetchone()[0],
+        }
+    },
+)
+_init()
 
 
-def set_setting(key: str, value: str) -> None:
-    db().execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
-    db().commit()
+class ScanIn(BaseModel):
+    name: str = Field(min_length=2, max_length=80)
+    target: str = Field(min_length=2, max_length=300)
+    scan_type: str = Field(pattern=r"^(secret|dependency|code|image)$")
+    sample_findings: int = Field(default=3, ge=0, le=20)
 
 
-def check_rate_limit(key: str) -> bool:
-    with rate_limit_lock:
-        current = int(time.time())
-        for bucket_key, (started, _) in list(RATE_BUCKETS.items()):
-            if current - started >= RATE_WINDOW_SECONDS:
-                RATE_BUCKETS.pop(bucket_key, None)
-        started, count = RATE_BUCKETS.get(key, (current, 0))
-        if current - started >= RATE_WINDOW_SECONDS:
-            started, count = current, 0
-        if count >= RATE_MAX_REQUESTS:
-            return False
-        RATE_BUCKETS[key] = (started, count + 1)
-        return True
-
-def internal_write_allowed(request: Request) -> bool:
-    if not INTERNAL_API_KEY:
-        return False
-    return secrets.compare_digest(request.headers.get("X-Internal-Token", ""), INTERNAL_API_KEY)
+class PolicyIn(BaseModel):
+    name: str = Field(min_length=2, max_length=80)
+    rule: str = Field(min_length=2, max_length=200)
+    action: str = Field(default="warn", pattern=r"^(block|warn)$")
 
 
-def record_audit(action: str, actor: str, detail: str = "", request_id: str = "", trace_id: str = "") -> None:
-    """本地写入带 SM3 完整性摘要的审计事件，并异步上报集中审计中心（不阻塞请求）。"""
-    import urllib.request as _urllib_request
-    event_id = str(uuid.uuid4())
-    event_timestamp = datetime.now(UTC).isoformat()
-    event = {"event_id": event_id, "service": SERVICE_NAME, "action": action, "actor": actor, "timestamp": event_timestamp, "request_id": request_id[:64], "trace_id": trace_id[:64], "detail": detail}
-    canonical = json.dumps(event, ensure_ascii=False, sort_keys=True)
-    integrity = sm3_hex(canonical)
-    with _db_lock:
-        db().execute(
-            "INSERT INTO audit_events (event_id, service, action, actor, timestamp, request_id, trace_id, detail, integrity) VALUES (?,?,?,?,?,?,?,?,?)",
-            (event_id, SERVICE_NAME, action, actor, event_timestamp, request_id[:64], trace_id[:64], canonical, integrity),
-        )
-        db().commit()
-    if AUDIT_CENTER_URL:
-        def _send() -> None:
-            try:
-                body = json.dumps({**event, "integrity": integrity}).encode("utf-8")
-                request = _urllib_request.Request(AUDIT_CENTER_URL.rstrip("/") + "/api/audit/events", data=body, headers={"Content-Type": "application/json", "X-Internal-Token": INTERNAL_API_KEY}, method="POST")
-                _urllib_request.urlopen(request, timeout=2)
-            except Exception:
-                pass
-        threading.Thread(target=_send, daemon=True).start()
+class FindingTriageIn(BaseModel):
+    status: str = Field(pattern=r"^(triaged|fixed|accepted)$")
+    note: str = Field(default="", max_length=300)
 
 
-def sm3_hex(value: str) -> str:
-    from gmssl import func, sm3
-    return sm3.sm3_hash(func.bytes_to_list(value.encode("utf-8")))
+_RULES = {
+    "secret": [("hardcoded-secret", "检测到硬编码密钥/口令"), ("aws-credential", "检测到 AWS 凭据"), ("private-key", "检测到私钥片段")],
+    "dependency": [("CVE-2026-0001", "依赖存在已知高危漏洞"), ("CVE-2026-0002", "依赖版本过期"), ("CVSS-9.1", "依赖存在严重漏洞")],
+    "code": [("injection-sqli", "存在 SQL 注入风险"), ("xss-reflected", "存在反射型 XSS 风险"), ("insecure-deserialization", "不安全的反序列化")],
+    "image": [("image-root-user", "镜像以 root 运行"), ("image-outdated-base", "基础镜像过旧"), ("image-non-pinned", "镜像标签未固定摘要")],
+}
 
 
-def _sm4_key() -> bytes:
-    existing = setting("sm4_key_hex")
-    if not existing:
-        existing = secrets.token_hex(16)
-        set_setting("sm4_key_hex", existing)
-    key = bytes.fromhex(existing)
-    if len(key) != 16:
-        raise ValueError("SM4 key must be 16 bytes")
-    return key
+@app.post("/api/devsecops/scans", status_code=status.HTTP_201_CREATED)
+def create_and_run_scan(payload: ScanIn, request: Request) -> dict[str, Any]:
+    base.require_internal_token(request)
+    scan_id = str(uuid.uuid4())
+    severity_cycle = ["critical", "high", "medium", "low"]
+    counts: dict[str, int] = {}
+    with base.db_ctx() as conn:
+        conn.execute("INSERT INTO scans (id, name, target, scan_type, status, severity_counts, created_at, finished_at) VALUES (?,?,?,?,?,?,?,?)", (scan_id, payload.name, payload.target, payload.scan_type, "completed", "{}", _now(), _now()))
+        rules = _RULES.get(payload.scan_type, _RULES["code"])
+        for i in range(payload.sample_findings):
+            rule, desc = rules[i % len(rules)]
+            severity = severity_cycle[i % len(severity_cycle)]
+            finding_id = str(uuid.uuid4())
+            conn.execute("INSERT INTO findings (id, scan_id, severity, rule, file, description, status, created_at) VALUES (?,?,?,?,?,?,?,?)", (finding_id, scan_id, severity, rule, f"src/app/{payload.scan_type}/sample_{i}.py", desc, "open", _now()))
+            counts[severity] = counts.get(severity, 0) + 1
+        conn.execute("UPDATE scans SET severity_counts=? WHERE id=?", (json.dumps(counts, ensure_ascii=False), scan_id))
+        base.record_audit("scan.completed", "internal", f"scan={scan_id} type={payload.scan_type} findings={payload.sample_findings}", getattr(request.state, "request_id", ""), getattr(request.state, "trace_id", ""), SERVICE)
+    return {"id": scan_id, "name": payload.name, "status": "completed", "severity_counts": counts, "findings": payload.sample_findings}
 
-def sm4_crypt(value: bytes, encrypt: bool) -> bytes:
-    from gmssl.sm4 import CryptSM4, SM4_DECRYPT, SM4_ENCRYPT
-    cipher = CryptSM4()
-    cipher.set_key(_sm4_key(), SM4_ENCRYPT if encrypt else SM4_DECRYPT)
-    if encrypt:
-        iv = secrets.token_bytes(16)
-        return iv + cipher.crypt_cbc(iv, value)
-    if len(value) < 16:
-        raise ValueError("ciphertext too short")
-    iv, body = value[:16], value[16:]
-    cipher.set_key(_sm4_key(), SM4_DECRYPT)
-    return cipher.crypt_cbc(iv, body)
 
-def b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+@app.get("/api/devsecops/scans")
+def list_scans() -> dict[str, Any]:
+    with base.db_ctx() as conn:
+        rows = conn.execute("SELECT * FROM scans ORDER BY created_at DESC").fetchall()
+    return {"items": [dict(r) for r in rows], "total": len(rows)}
 
-def b64url_decode(data: str) -> bytes:
-    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
 
-def verify_jwt(token: str) -> dict[str, object] | None:
-    secret = JWT_SECRET or setting("jwt_secret")
-    if not secret:
-        return None
-    try:
-        header_b64, claims_b64, signature_b64 = token.split(".")
-        signing_input = f"{header_b64}.{claims_b64}".encode()
-        expected = hmac.new(secret.encode(), signing_input, hashlib.sha256).digest()
-        if not hmac.compare_digest(expected, b64url_decode(signature_b64)):
-            return None
-        claims = json.loads(b64url_decode(claims_b64))
-        if int(claims.get("exp", 0)) < time.time():
-            return None
-        return claims
-    except Exception:
-        return None
+@app.get("/api/devsecops/scans/{scan_id}")
+def get_scan(scan_id: str) -> dict[str, Any]:
+    with base.db_ctx() as conn:
+        scan = conn.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not scan:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "扫描任务不存在")
+        findings = conn.execute("SELECT * FROM findings WHERE scan_id=?", (scan_id,)).fetchall()
+    return {**dict(scan), "findings": [dict(r) for r in findings]}
 
-PUBLIC_PATHS = {"/api/overview", "/api/crypto/status", "/api/ops/metrics", "/api/integration/manifest", "/api/security/baseline", "/api/crypto/sm3"}
 
-def authorized(request: Request) -> bool:
-    if internal_write_allowed(request):
-        return True
-    if not (JWT_SECRET or setting("jwt_secret")):
-        return True
-    authorization = request.headers.get("Authorization", "")
-    return authorization.startswith("Bearer ") and verify_jwt(authorization[7:]) is not None
+@app.get("/api/devsecops/findings")
+def list_findings(severity: str | None = None, status_: str | None = None) -> dict[str, Any]:
+    clauses, params = [], []
+    if severity:
+        clauses.append("severity=?")
+        params.append(severity)
+    if status_:
+        clauses.append("status=?")
+        params.append(status_)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    with base.db_ctx() as conn:
+        rows = conn.execute(f"SELECT * FROM findings{where} ORDER BY created_at DESC LIMIT 200", params).fetchall()
+    return {"items": [dict(r) for r in rows], "total": len(rows)}
 
-app = FastAPI(title=DISPLAY_NAME, version=VERSION, description=DESCRIPTION, docs_url=None, redoc_url=None)
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 
-class Item(BaseModel):
-    name: str = Field(min_length=1, max_length=120)
-    owner: str = Field(default="平台工程部", min_length=1, max_length=80)
-    priority: Literal["P0", "P1", "P2", "P3"] = "P1"
-    status: Literal["planned", "active", "review", "closed"] = "active"
+@app.post("/api/devsecops/findings/{finding_id}/triage")
+def triage_finding(finding_id: str, payload: FindingTriageIn, request: Request) -> dict[str, Any]:
+    base.require_internal_token(request)
+    with base.db_ctx() as conn:
+        if conn.execute("UPDATE findings SET status=? WHERE id=?", (payload.status, finding_id)).rowcount == 0:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "漏洞记录不存在")
+        base.record_audit("finding.triaged", "internal", f"finding={finding_id} status={payload.status}", getattr(request.state, "request_id", ""), getattr(request.state, "trace_id", ""), SERVICE)
+    return {"id": finding_id, "status": payload.status}
 
-ITEMS: list[dict[str, object]] = [
-    {"id": "demo-1", "name": "核心能力基线", "owner": "平台工程部", "priority": "P1", "status": "active", "created_at": datetime.now(UTC).isoformat()},
-    {"id": "demo-2", "name": "安全与审计策略", "owner": "安全合规部", "priority": "P1", "status": "review", "created_at": datetime.now(UTC).isoformat()},
-]
 
-@app.middleware("http")
-async def security_headers(request: Request, call_next):
-    started = time.perf_counter()
-    request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
-    trace_id = request.headers.get("X-Trace-Id") or str(uuid.uuid4())
-    request.state.request_id = request_id[:64]
-    request.state.trace_id = trace_id[:64]
-    if request.url.path.startswith("/api/") and request.url.path not in PUBLIC_PATHS and not authorized(request):
-        response = Response(status_code=status.HTTP_401_UNAUTHORIZED, content="认证无效")
-    else:
-        content_length = request.headers.get("content-length")
-        if content_length:
-            try:
-                body_size = int(content_length)
-            except ValueError:
-                response = Response(status_code=400, content="Invalid Content-Length")
-            else:
-                if body_size < 0 or body_size > MAX_REQUEST_BYTES:
-                    response = Response(status_code=413, content="Request body too large")
-                elif not check_rate_limit(f"{request.client.host if request.client else 'unknown'}:{request.url.path}"):
-                    response = Response(status_code=429, content="Too many requests", headers={"Retry-After": str(RATE_WINDOW_SECONDS)})
-                else:
-                    response = await call_next(request)
-        elif not check_rate_limit(f"{request.client.host if request.client else 'unknown'}:{request.url.path}"):
-            response = Response(status_code=429, content="Too many requests", headers={"Retry-After": str(RATE_WINDOW_SECONDS)})
-        else:
-            response = await call_next(request)
-    elapsed = (time.perf_counter() - started) * 1000
-    REQUESTS["total"] += 1
-    REQUESTS["latency_ms_total"] += elapsed
-    if response.status_code >= 500:
-        REQUESTS["errors"] += 1
-    response.headers["X-Request-Id"] = request_id[:64]
-    response.headers["X-Trace-Id"] = trace_id[:64]
-    response.headers["X-Process-Time-Ms"] = f"{elapsed:.2f}"
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
-    response.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
-    if ENVIRONMENT == "production":
-        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-    response.headers["Cache-Control"] = "no-store" if request.url.path.startswith("/api/") else "no-cache"
-    return response
+@app.post("/api/devsecops/policies", status_code=status.HTTP_201_CREATED)
+def create_policy(payload: PolicyIn, request: Request) -> dict[str, Any]:
+    base.require_internal_token(request)
+    policy_id = str(uuid.uuid4())
+    with base.db_ctx() as conn:
+        try:
+            conn.execute("INSERT INTO policies VALUES (?,?,?,?,1)", (policy_id, payload.name, payload.rule, payload.action))
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status.HTTP_409_CONFLICT, "策略已存在") from exc
+    return {"id": policy_id, "name": payload.name}
 
-@app.get("/", include_in_schema=False)
-def console() -> FileResponse:
-    return FileResponse("app/static/index.html")
 
-@app.get("/health")
-def health() -> dict[str, object]:
-    return {"status": "ok", "service": SERVICE_NAME, "name": DISPLAY_NAME, "version": VERSION, "timestamp": datetime.now(UTC).isoformat()}
+@app.get("/api/devsecops/policies")
+def list_policies() -> dict[str, Any]:
+    with base.db_ctx() as conn:
+        rows = conn.execute("SELECT * FROM policies").fetchall()
+    return {"items": [dict(r) for r in rows], "total": len(rows)}
 
-@app.get("/readyz")
-def readyz() -> dict[str, object]:
-    return {"status": "ready", "service": SERVICE_NAME, "checks": {"runtime": "ok", "configuration": "ok", "database": "ok" if db() else "error"}}
 
-@app.get("/api/overview")
-def overview() -> dict[str, object]:
-    return {"platform": {"name": DISPLAY_NAME, "version": VERSION, "description": DESCRIPTION}, "items": ITEMS, "total": len(ITEMS), "active": sum(1 for i in ITEMS if i["status"] == "active")}
+@app.post("/api/devsecops/scans/{scan_id}/sbom", status_code=status.HTTP_201_CREATED)
+def create_sbom(scan_id: str, request: Request) -> dict[str, Any]:
+    base.require_internal_token(request)
+    with base.db_ctx() as conn:
+        scan = conn.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not scan:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "扫描任务不存在")
+        sbom_id = str(uuid.uuid4())
+        content = json.dumps({"bomFormat": "CycloneDX", "specVersion": "1.5", "serialNumber": f"urn:uuid:{sbom_id}", "metadata": {"component": {"name": scan["target"], "type": "application"}}}, ensure_ascii=False)
+        conn.execute("INSERT INTO sboms VALUES (?,?,?,?,?)", (sbom_id, scan_id, "cyclonedx", content, _now()))
+    return {"id": sbom_id, "scan_id": scan_id, "format": "cyclonedx"}
 
-@app.post("/api/items", status_code=status.HTTP_201_CREATED)
-def create_item(payload: Item, request: Request) -> dict[str, object]:
-    if not internal_write_allowed(request):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "内部写入令牌无效")
-    item = {"id": str(uuid.uuid4()), **payload.model_dump(), "created_at": datetime.now(UTC).isoformat()}
-    ITEMS.append(item)
-    record_audit("resource.created", "internal", f"id={item['id']} name={payload.name}", getattr(request.state, "request_id", ""), getattr(request.state, "trace_id", ""))
-    return item
 
-@app.patch("/api/items/{item_id}/status")
-def update_item_status(item_id: str, item_status: Literal["planned", "active", "review", "closed"], request: Request) -> dict[str, object]:
-    if not internal_write_allowed(request):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "内部写入令牌无效")
-    for item in ITEMS:
-        if item["id"] == item_id:
-            item["status"] = item_status
-            record_audit("resource.status_changed", "internal", f"id={item_id} status={item_status}", getattr(request.state, "request_id", ""), getattr(request.state, "trace_id", ""))
-            return item
-    raise HTTPException(status.HTTP_404_NOT_FOUND, "资源不存在")
-
-@app.get("/api/ops/metrics")
-def metrics() -> dict[str, object]:
-    total = int(REQUESTS["total"])
-    avg = round(float(REQUESTS["latency_ms_total"]) / total, 2) if total else 0.0
-    return {"service": SERVICE_NAME, "version": VERSION, "requests_total": total, "errors_total": int(REQUESTS["errors"]), "avg_latency_ms": avg}
-
-@app.get("/metrics")
-def prometheus_metrics() -> Response:
-    total = int(REQUESTS["total"])
-    body = (
-        f"sm_{SERVICE_NAME}_requests_total {total}\n"
-        f"sm_{SERVICE_NAME}_errors_total {int(REQUESTS['errors'])}\n"
-        f"sm_{SERVICE_NAME}_latency_ms_total {REQUESTS['latency_ms_total']:.2f}\n"
-    )
-    return Response(content=body, media_type="text/plain; version=0.0.4")
-
-@app.get("/api/integration/manifest")
-def integration_manifest() -> dict[str, object]:
-    return {
-        "service": SERVICE_NAME,
-        "name": DISPLAY_NAME,
-        "version": VERSION,
-        "dependencies": INTEGRATION_DEPENDENCIES,
-        "events": INTEGRATION_EVENTS,
-        "health_path": "/health",
-        "metrics_path": "/api/ops/metrics",
-        "overview_path": "/api/overview",
-    }
-
-@app.post("/api/crypto/sm3")
-def crypto_sm3(payload: dict[str, str]) -> dict[str, str]:
-    value = payload.get("value", "")
-    if len(value) > 10000:
-        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "内容过大")
-    return {"algorithm": "SM3", "digest": sm3_hex(value)}
-
-@app.post("/api/crypto/encrypt")
-def crypto_encrypt(payload: dict[str, str]) -> dict[str, str]:
-    value = payload.get("value", "")
-    if len(value) > 10000:
-        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "内容过大")
-    return {"algorithm": "SM4-CBC", "ciphertext": sm4_crypt(value.encode("utf-8"), True).hex()}
-
-@app.post("/api/crypto/decrypt")
-def crypto_decrypt(payload: dict[str, str]) -> dict[str, str]:
-    try:
-        value = bytes.fromhex(payload.get("value", ""))
-    except ValueError:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "密文必须是十六进制")
-    return {"algorithm": "SM4-CBC", "plaintext": sm4_crypt(value, False).decode("utf-8")}
-
-@app.get("/api/crypto/status")
-def crypto_status() -> dict[str, object]:
-    return {"algorithm": "SM3/SM4", "sm3": "enabled", "sm4": "enabled", "key_source": "SM4_KEY_HEX / persisted setting"}
-
-@app.get("/api/security/baseline")
-def security_baseline() -> dict[str, object]:
-    return {
-        "service": SERVICE_NAME,
-        "version": VERSION,
-        "controls": {
-            "trusted_host": True,
-            "security_headers": True,
-            "csp": True,
-            "rate_limit": True,
-            "request_size_limit": True,
-            "sm3": True,
-            "sm4": True,
-            "internal_token": bool(INTERNAL_API_KEY),
-            "jwt": bool(JWT_SECRET or setting("jwt_secret")),
-            "audit_persistence": True,
-            "audit_forwarding": bool(AUDIT_CENTER_URL),
-        },
-        "recommended": ["OIDC/MFA", "KMS/HSM", "centralized audit", "OpenTelemetry"],
-    }
+@app.get("/api/devsecops/stats")
+def stats() -> dict[str, Any]:
+    with base.db_ctx() as conn:
+        def _count(sql: str) -> int:
+            return conn.execute(sql).fetchone()[0]
+        return {
+            "scans": _count("SELECT COUNT(*) FROM scans"),
+            "findings_open": _count("SELECT COUNT(*) FROM findings WHERE status='open'"),
+            "findings_fixed": _count("SELECT COUNT(*) FROM findings WHERE status='fixed'"),
+            "critical": _count("SELECT COUNT(*) FROM findings WHERE severity='critical' AND status='open'"),
+            "high": _count("SELECT COUNT(*) FROM findings WHERE severity='high' AND status='open'"),
+            "blocking_policies": _count("SELECT COUNT(*) FROM policies WHERE action='block' AND enabled=1"),
+        }

@@ -1,88 +1,73 @@
+"""SM DevSecOps 领域测试：扫描、漏洞闭环、策略与 SBOM。"""
+
+import pytest
 from fastapi.testclient import TestClient
-from app.main import app
+
+from app import base
+from app.main import VERSION, app
 
 
-def test_health_and_security_headers():
-    with TestClient(app) as client:
-        response = client.get('/health', headers={'X-Request-Id': 'suite-test'})
-        assert response.status_code == 200
-        assert response.headers['X-Request-Id'] == 'suite-test'
-        assert response.headers['X-Frame-Options'] == 'DENY'
-        assert response.json()['version'] == '2.1.0'
+@pytest.fixture()
+def client(monkeypatch):
+    monkeypatch.setattr(base, "internal_api_key", lambda: "TEST")
+    base.reset_state()
+    from app.main import _init as init_db
+    init_db()
+    with TestClient(app) as c:
+        c.headers["X-Internal-Token"] = "TEST"
+        yield c
 
 
-def test_overview_and_item_lifecycle(monkeypatch):
-    from app import main
-    monkeypatch.setattr(main, 'INTERNAL_API_KEY', 'TEST')
-    with TestClient(app) as client:
-        overview = client.get('/api/overview').json()
-        assert overview['total'] >= 2
-        created = client.post('/api/items', headers={'X-Internal-Token': 'TEST'}, json={'name': '企业级测试资源', 'owner': '测试部', 'priority': 'P2'}).json()
-        assert created['status'] == 'active'
-        updated = client.patch(f"/api/items/{created['id']}/status?item_status=review", headers={'X-Internal-Token': 'TEST'})
-        assert updated.status_code == 200
-        assert updated.json()['status'] == 'review'
+def test_health_and_version(client):
+    r = client.get("/health", headers={"X-Request-Id": "suite-test"})
+    assert r.status_code == 200
+    assert r.json()["version"] == VERSION
 
 
-def test_ops_metrics():
-    with TestClient(app) as client:
-        client.get('/health')
-        metrics = client.get('/api/ops/metrics')
-        assert metrics.status_code == 200
-        assert metrics.json()['requests_total'] >= 1
+def test_scan_and_findings(client):
+    scan = client.post("/api/devsecops/scans", json={"name": "secret-scan", "target": "repo/app", "scan_type": "secret", "sample_findings": 5}).json()
+    assert scan["status"] == "completed"
+    assert scan["findings"] == 5
+    assert sum(scan["severity_counts"].values()) == 5
+    detail = client.get(f"/api/devsecops/scans/{scan['id']}").json()
+    assert len(detail["findings"]) == 5
+    assert client.get("/api/devsecops/findings", params={"severity": "critical"}).json()["total"] >= 0
 
 
-
-def test_integration_manifest_contract():
-    with TestClient(app) as client:
-        response = client.get('/api/integration/manifest')
-        assert response.status_code == 200
-        payload = response.json()
-        assert payload['service']
-        assert payload['version'] == '2.1.0'
-        assert '/api/ops/metrics' == payload['metrics_path']
-        assert isinstance(payload['dependencies'], list)
+def test_finding_triage(client):
+    scan = client.post("/api/devsecops/scans", json={"name": "code-scan", "target": "repo/app", "scan_type": "code", "sample_findings": 2}).json()
+    finding_id = client.get(f"/api/devsecops/scans/{scan['id']}").json()["findings"][0]["id"]
+    assert client.post(f"/api/devsecops/findings/{finding_id}/triage", json={"status": "fixed", "note": "已修复"}).json()["status"] == "fixed"
+    assert client.get("/api/devsecops/findings", params={"status_": "fixed"}).json()["total"] == 1
+    assert client.post("/api/devsecops/findings/nope/triage", json={"status": "fixed"}).status_code == 404
 
 
-
-def test_request_size_and_rate_limit_guards(monkeypatch):
-    from app import main
-    main.RATE_BUCKETS.clear()
-    monkeypatch.setattr(main, 'MAX_REQUEST_BYTES', 4)
-    monkeypatch.setattr(main, 'RATE_MAX_REQUESTS', 1)
-    with TestClient(app) as client:
-        oversized = client.post('/api/items', content='12345', headers={'content-type': 'application/json'})
-        assert oversized.status_code == 413
-        assert client.get('/health').status_code == 200
-        limited = client.get('/health')
-        assert limited.status_code == 429
-        assert limited.headers['Retry-After']
+def test_policy(client):
+    assert client.post("/api/devsecops/policies", json={"name": "block-critical", "rule": "severity == critical", "action": "block"}).status_code == 201
+    assert client.post("/api/devsecops/policies", json={"name": "block-critical", "rule": "block", "action": "block"}).status_code == 409
+    assert client.get("/api/devsecops/policies").json()["total"] == 1
 
 
-def test_internal_write_token_is_enforced(monkeypatch):
-    from app import main
-    monkeypatch.setattr(main, 'INTERNAL_API_KEY', 'TOKEN')
-    with TestClient(app) as client:
-        blocked = client.post('/api/items', json={'name': 'blocked'})
-        assert blocked.status_code == 403
-        allowed = client.post('/api/items', headers={'X-Internal-Token': 'TOKEN'}, json={'name': 'allowed'})
-        assert allowed.status_code == 201
+def test_sbom(client):
+    scan = client.post("/api/devsecops/scans", json={"name": "dep-scan", "target": "svc", "scan_type": "dependency", "sample_findings": 0}).json()
+    sbom = client.post(f"/api/devsecops/scans/{scan['id']}/sbom").json()
+    assert sbom["format"] == "cyclonedx"
+    assert client.post("/api/devsecops/scans/nope/sbom").status_code == 404
 
 
-
-def test_sm3_crypto_endpoint():
-    with TestClient(app) as client:
-        response = client.post('/api/crypto/sm3', json={'value': 'enterprise'})
-        assert response.status_code == 200
-        assert response.json()['algorithm'] == 'SM3'
-        assert len(response.json()['digest']) == 64
-        assert client.get('/api/crypto/status').json()['sm4'] == 'enabled'
+def test_stats(client):
+    client.post("/api/devsecops/scans", json={"name": "s1", "target": "repo", "scan_type": "code", "sample_findings": 3})
+    stats = client.get("/api/devsecops/stats").json()
+    assert stats["scans"] == 1
+    assert stats["findings_open"] == 3
 
 
+def test_manifest_and_crypto(client):
+    assert client.get("/api/integration/manifest").json()["version"] == VERSION
+    enc = client.post("/api/crypto/encrypt", json={"value": "x"}).json()["ciphertext"]
+    assert client.post("/api/crypto/decrypt", json={"value": enc}).json()["plaintext"] == "x"
 
-def test_security_baseline():
-    with TestClient(app) as client:
-        payload = client.get('/api/security/baseline').json()
-        assert payload['controls']['sm3'] is True
-        assert payload['controls']['sm4'] is True
-        assert payload['controls']['rate_limit'] is True
+
+def test_write_requires_auth(client):
+    del client.headers["X-Internal-Token"]
+    assert client.post("/api/devsecops/scans", json={"name": "x", "target": "t", "scan_type": "code"}).status_code == 401
