@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from app import base
 
 SERVICE = "sm-devsecops"
-VERSION = "2.0.0"
+VERSION = "3.0.0"
 NAME = "SM DevSecOps"
 DESCRIPTION = "安全研发平台：扫描任务、漏洞闭环、安全策略与 SBOM"
 PORT = 8340
