@@ -1,0 +1,12 @@
+apiVersion: v2
+name: sm-devsecops
+description: SM 微服务 Helm Chart - SM-DevSecOps（DevSecOps 服务）
+type: application
+version: 1.0.0
+appVersion: "2.1.0"
+keywords:
+  - sm-microservices
+  - enterprise
+  - sm-devsecops
+maintainers:
+  - name: sm-platform-team
